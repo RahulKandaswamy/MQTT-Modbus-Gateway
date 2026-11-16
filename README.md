@@ -1,4 +1,4 @@
-# X-IoT Gateway
+# MQTT-Modbus IoT Gateway
 
 Firmware for an ESP32-S3 industrial gateway that polls **Modbus RTU** devices over RS485,
 publishes tag values to an **MQTT** broker, accepts write commands over MQTT, and is
