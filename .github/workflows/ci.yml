@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main, development, "release/**", "feature/**", "fix/**", "chore/**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Unit tests (native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-native-${{ hashFiles('platformio.ini') }}
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+      - name: Run tests
+        run: pio test -e native
+
+  firmware:
+    name: Firmware build (ESP32-S3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            .pio/libdeps
+          key: pio-esp32s3-${{ hashFiles('platformio.ini') }}
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+      - name: Build firmware
+        run: pio run -e esp32-s3-relay-1ch
+      - name: Build LittleFS image
+        run: pio run -e esp32-s3-relay-1ch -t buildfs
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ github.sha }}
+          path: |
+            .pio/build/esp32-s3-relay-1ch/firmware.bin
+            .pio/build/esp32-s3-relay-1ch/bootloader.bin
+            .pio/build/esp32-s3-relay-1ch/partitions.bin
+            .pio/build/esp32-s3-relay-1ch/littlefs.bin
+          if-no-files-found: error
+
+  portal:
+    name: Web portal build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: portal
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: portal/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - name: Check data/index.html is up to date with portal sources
+        working-directory: .
+        run: |
+          if ! git diff --exit-code --ignore-all-space -- data/index.html; then
+            echo "::error::data/index.html is stale. Run 'npm run build' in portal/ and commit the result."
+            exit 1
+          fi

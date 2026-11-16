@@ -1,0 +1,36 @@
+{
+  "wifi": {
+    "ssid": "your_ssid",
+    "password": "your_pass",
+    "autoReconnect": true,
+    "reconnectTimeoutMs": 20000
+  },
+  "mqtt": {
+    "broker": "broker_ip",
+    "port": 1883,
+    "username": "your_username",
+    "password": "your_password",
+    "clientId": "your_client_id",
+    "secure": false,
+    "cleanSession": false,
+    "autoReconnect": true,
+    "keepAlive": 120
+  },
+  "modbus": {
+    "baudrate": 9600,
+    "serialConfig": "SERIAL_8N1",
+    "txPin": 17,
+    "rxPin": 18,
+    "timeoutMs": 2000
+  },
+  "acquisition": {
+    "scanIntervalMs": 10000
+  },
+  "publisher": {
+    "publishIntervalMs": 20000
+  },
+  "portal": {
+    "username": "admin",
+    "password": "change-me"
+  }
+}

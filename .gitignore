@@ -1,0 +1,18 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# VS Code (keep extensions.json)
+.vscode/*
+!.vscode/extensions.json
+
+# Portal (Node / Vite)
+node_modules/
+portal/dist/
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp

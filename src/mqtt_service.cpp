@@ -1,0 +1,247 @@
+#include <PsychicMqttClient.h>
+#include "mqtt_service.h"
+#include "subscriber.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "logger.h"
+#include "system_events.h"
+#include "event_service.h"
+
+#define MODULE "MQTT-CLIENT"
+#define MAX_URI_LENGTH 64
+
+static QueueHandle_t gTxQueue = NULL;
+static TaskHandle_t gTaskHandle = NULL;
+
+static mqtt_config_t gConfig;
+static mqtt_state_t gState = MQTT_STATE_DEINITIALIZED;
+static mqtt_connection_state_t gConnState = MQTT_CONN_DISCONNECTED;
+
+static portMUX_TYPE gStateMux = portMUX_INITIALIZER_UNLOCKED; 
+static portMUX_TYPE gConnStateMux = portMUX_INITIALIZER_UNLOCKED;
+
+static PsychicMqttClient gClient;
+static char gURI[MAX_URI_LENGTH];
+static char gStatusTopic[MQTT_MAX_TOPIC_LENGTH];
+
+// Thread-safe state getter
+mqtt_state_t mqtt_get_state(){
+  mqtt_state_t stateCopy;
+  portENTER_CRITICAL(&gStateMux);
+  stateCopy = gState;
+  portEXIT_CRITICAL(&gStateMux);
+  return stateCopy;
+}
+
+// Thread-safe state setter
+static void mqtt_set_state(mqtt_state_t newState){
+  portENTER_CRITICAL(&gStateMux);
+  gState = newState;
+  portEXIT_CRITICAL(&gStateMux);
+}
+
+// Thread-safe connection state getter
+mqtt_connection_state_t mqtt_get_connection_state(){
+  mqtt_connection_state_t stateCopy;
+  portENTER_CRITICAL(&gConnStateMux);
+  stateCopy = gConnState;
+  portEXIT_CRITICAL(&gConnStateMux);
+  return stateCopy;
+}
+
+// Thread-safe connection state setter
+static void mqtt_set_connection_state(mqtt_connection_state_t newState){
+  portENTER_CRITICAL(&gConnStateMux);
+  gConnState = newState;
+  portEXIT_CRITICAL(&gConnStateMux);
+}
+
+// QueueHandle_t mqtt_get_tx_queue(){
+//   if(mqtt_get_state() == MQTT_STATE_DEINITIALIZED) return NULL;
+//   return gTxQueue;
+// }
+
+sys_status_t mqtt_subscribe(const char *topic, uint8_t qos){
+  if(mqtt_get_state() != MQTT_STATE_RUNNING){
+    LOG_ERROR(MODULE, "Invalid state");
+    return SYS_ERR_INVALID_STATE;
+  }
+
+  if(topic == NULL){
+    LOG_ERROR(MODULE, "Invalid params");
+    return SYS_ERR_INVALID_PARAM;
+  }
+      
+  int msgId = gClient.subscribe(topic, qos);
+  if(msgId == -1){
+    LOG_ERROR(MODULE, "Subscribe failed, topic: %s", topic);
+    return SYS_ERR_FAIL;
+  }
+
+  LOG_INFO(MODULE, "Subscribing at QoS: %d, packet id: %d, topic: %s", qos, msgId, topic);
+  return SYS_OK;
+}
+
+sys_status_t mqtt_publish(const mqtt_msg_t *msg){
+  if(mqtt_get_state() != MQTT_STATE_RUNNING){
+    LOG_ERROR(MODULE, "Invalid state");
+    return SYS_ERR_INVALID_STATE;
+  } 
+
+  if(msg == NULL){
+    LOG_ERROR(MODULE, "Invalid params");
+    return SYS_ERR_INVALID_PARAM;
+  }
+  
+  if(xQueueSend(gTxQueue, msg, 500) != pdPASS){
+    LOG_ERROR(MODULE, "Failed to post message");
+    return SYS_ERR_FAIL;
+  } 
+  return SYS_OK;
+}
+
+static void mqttTask(void *pv){
+  mqtt_msg_t msg;
+  LOG_INFO(MODULE, "Task started");
+  
+  gClient.connect();
+  mqtt_set_connection_state(MQTT_CONN_CONNECTING);
+  
+  while (mqtt_get_state() == MQTT_STATE_RUNNING){
+    if(xQueueReceive(gTxQueue, &msg, pdMS_TO_TICKS(1000)) != pdPASS) continue;
+    
+    if(mqtt_get_connection_state() != MQTT_CONN_CONNECTED){
+      LOG_WARN(MODULE, "Not connected to the broker, dropping message");
+      continue;
+    }
+
+    int msgId = gClient.publish(msg.topic, msg.qos, msg.retain, msg.payload, msg.len);
+    if(msgId == -1){
+      LOG_WARN(MODULE, "Publish failed, topic: %s", msg.topic);
+      continue;
+    }
+    LOG_INFO(MODULE, "Publishing at QoS %d, packetId: %d, topic: %s, payload: %s", msg.qos, msgId, msg.topic, msg.payload);
+  }
+
+  gClient.disconnect();
+  mqtt_set_connection_state(MQTT_CONN_DISCONNECTED);
+
+  gTaskHandle = NULL;
+  LOG_INFO(MODULE, "Stopped");
+  vTaskDelete(NULL);
+}
+
+sys_status_t mqtt_init(const mqtt_config_t* cfg){
+  if(mqtt_get_state() != MQTT_STATE_DEINITIALIZED){
+    LOG_ERROR(MODULE, "invalid state");
+    return SYS_ERR_INVALID_STATE;
+  } 
+
+  if(cfg == NULL){
+    LOG_ERROR(MODULE, "invalid parmas");
+    return SYS_ERR_INVALID_PARAM;
+  }
+
+  LOG_INFO(MODULE, "Initializing...");
+  memcpy(&gConfig, cfg, sizeof(mqtt_config_t));
+  snprintf(gURI, sizeof(gURI), "%s://%s:%u", gConfig.secure ? "mqtts" : "mqtt", gConfig.broker, gConfig.port);
+  snprintf(gStatusTopic, sizeof(gStatusTopic), "%s/MQTT-YT-300", gConfig.clientId);
+
+  gTxQueue = xQueueCreate(30, sizeof(mqtt_msg_t));
+  if(gTxQueue == NULL){
+    LOG_ERROR(MODULE, "Failed to create queue");
+    return SYS_ERR_NO_MEMORY;
+  }
+
+  gClient
+  .setServer(gURI)
+  .setCredentials(gConfig.username, gConfig.password)
+  .setClientId(gConfig.clientId)
+  .setKeepAlive(gConfig.keepAlive)
+  .setCleanSession(gConfig.cleanSession)
+  .setAutoReconnect(gConfig.autoReconnect)
+  .setCACert(gConfig.caCert)
+  .setWill(gStatusTopic, 1, true, "{\"value\":0}")
+  .onConnect([](bool sp){
+    LOG_INFO(MODULE, "Connected to the broker");
+    event_post(APP_EVENTS, APP_EVENT_MQTT_CONNECTED, NULL, 0);
+    mqtt_set_connection_state(MQTT_CONN_CONNECTED);
+    mqtt_msg_t statusMsg = {};
+
+    strncpy(statusMsg.topic, gStatusTopic, sizeof(statusMsg.topic)-1);
+    statusMsg.topic[sizeof(statusMsg.topic)-1] = '\0';
+
+    strncpy(statusMsg.payload, "{\"value\":1}", sizeof(statusMsg.payload)-1);
+    statusMsg.payload[sizeof(statusMsg.payload)-1] = '\0';
+
+    statusMsg.len = strnlen(statusMsg.payload, sizeof(statusMsg.payload)-1);
+    statusMsg.qos = 1;
+    statusMsg.retain = true;
+    mqtt_publish(&statusMsg);
+  })
+  .onDisconnect([](bool sp){
+    LOG_INFO(MODULE, "Disconnected from broker");
+    event_post(APP_EVENTS, APP_EVENT_MQTT_DISCONNECTED, NULL, 0);
+    if(mqtt_get_state() == MQTT_STATE_RUNNING){
+        LOG_INFO(MODULE, "Auto-reconnecting...");
+        mqtt_set_connection_state(MQTT_CONN_CONNECTING);
+    } else {
+        mqtt_set_connection_state(MQTT_CONN_DISCONNECTED);
+    }
+  })
+  .onPublish([](uint16_t packetId){
+    LOG_INFO(MODULE, "Publish acknowledged, packet id: %d", packetId);
+  })
+  .onSubscribe([](uint16_t packetId){
+    LOG_INFO(MODULE, "Subscribe acknowledged, packet id: %d", packetId);
+  })
+  .onMessage([](char* topic, char* payload, int qos, bool retain, bool dup){
+    mqtt_msg_t msg = {};
+
+    strncpy(msg.topic, topic, sizeof(msg.topic)-1);
+    msg.topic[sizeof(msg.topic)-1] = '\0';
+    strncpy(msg.payload, payload, sizeof(msg.payload)-1);
+    msg.payload[sizeof(msg.payload)-1] = '\0';
+    msg.len = strnlen(payload, sizeof(msg.payload)-1);
+    msg.qos = qos;
+    msg.retain = retain;
+
+    subscriber_post(&msg);
+  });
+
+  mqtt_set_state(MQTT_STATE_INITIALIZED);
+  LOG_INFO(MODULE, "Initialize success");
+  return SYS_OK;
+}
+
+sys_status_t mqtt_start(void){
+  mqtt_state_t current = mqtt_get_state();
+  if(current != MQTT_STATE_INITIALIZED && current != MQTT_STATE_STOPPED){
+    LOG_ERROR(MODULE, "invalid state");
+    return SYS_ERR_INVALID_STATE;
+  }
+  
+  LOG_INFO(MODULE, "Starting...");
+
+  xQueueReset(gTxQueue);
+  mqtt_set_state(MQTT_STATE_RUNNING);
+  
+  if(xTaskCreatePinnedToCore(mqttTask, "mqtt_task", 4096, NULL, 5, &gTaskHandle, 1) != pdPASS){
+    LOG_ERROR(MODULE, "Failed to create task");
+    mqtt_set_state(MQTT_STATE_STOPPED);
+    return SYS_ERR_NO_MEMORY;
+  }
+
+  return SYS_OK;
+}
+
+sys_status_t mqtt_stop(void){
+  if(mqtt_get_state() != MQTT_STATE_RUNNING){
+    LOG_ERROR(MODULE, "invalid state");
+    return SYS_ERR_INVALID_STATE;
+  }
+  
+  LOG_INFO(MODULE, "Stopping...");
+  mqtt_set_state(MQTT_STATE_STOPPED);
+  return SYS_OK;
+}
